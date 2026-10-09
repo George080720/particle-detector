@@ -1,6 +1,7 @@
 import streamlit as st
 import cv2
 import numpy as np
+import pandas as pd
 from scipy.spatial import distance_matrix
 
 st.title("粒子检测工具")
@@ -9,7 +10,6 @@ st.title("粒子检测工具")
 uploaded = st.file_uploader("上传 SEM 图", type=['png', 'jpg'])
 
 if uploaded:
-    # 从上传的文件字节流解码图片
     file_bytes = np.asarray(bytearray(uploaded.read()), dtype=np.uint8)
     img = cv2.imdecode(file_bytes, cv2.IMREAD_GRAYSCALE)
 
@@ -17,7 +17,7 @@ if uploaded:
         st.error("图片读取失败，请换一张图。")
         st.stop()
 
-    st.image(img, caption="原图", use_column_width=True)
+    st.image(img, caption="原图", use_container_width=True)
 
     # ========== 2. 滑动条 ==========
     st.subheader("染色区间")
@@ -31,30 +31,26 @@ if uploaded:
         l2 = st.slider("L2", 0, 255, 154)
         u2 = st.slider("U2", 0, 255, 245)
 
-    # 防止 lower > upper
     if l1 > u1:
         l1 = u1
     if l2 > u2:
         l2 = u2
 
     # ========== 3. 染色预览 ==========
-    mask1 = cv2.inRange(img, l1, u1)   # 暗心
-    mask2 = cv2.inRange(img, l2, u2)   # 亮圈
+    mask1 = cv2.inRange(img, l1, u1)
+    mask2 = cv2.inRange(img, l2, u2)
     mask = cv2.bitwise_or(mask1, mask2)
 
     img_color = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-    img_color[mask1 > 0] = [0, 0, 255]    # 红色（暗心）
-    img_color[mask2 > 0] = [255, 0, 0]    # 蓝色（亮圈）
+    img_color[mask1 > 0] = [0, 0, 255]
+    img_color[mask2 > 0] = [255, 0, 0]
 
-    st.image(img_color, caption="染色预览", use_column_width=True)
+    st.image(img_color, caption="染色预览", use_container_width=True)
 
     # ========== 4. 检测 ==========
     if st.button("检测"):
 
-        # 形态学去噪
         final_mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
-
-        # 连通域分析
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(final_mask)
 
         props = []
@@ -65,7 +61,6 @@ if uploaded:
                 continue
             props.append((y, x, area))
 
-        # 去重
         def merge_close(points, min_dist=5):
             merged = []
             for y, x, area in points:
@@ -89,8 +84,9 @@ if uploaded:
             avg_spacing = nearest_dist.mean()
         else:
             avg_spacing = 0
+            nearest_dist = np.array([])
 
-        # ========== 5. 输出：染色图 + 底部结论文字 ==========
+        # ========== 5. 输出：染色图 + 结论文字 ==========
         out_img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
         out_img[mask1 > 0] = [0, 0, 255]
         out_img[mask2 > 0] = [255, 0, 0]
@@ -98,19 +94,66 @@ if uploaded:
         h, w = out_img.shape[:2]
         text1 = f"Particles: {len(props)}"
         text2 = f"Avg Spacing: {avg_spacing:.1f} px"
-
         cv2.putText(out_img, text1, (10, h-50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 4)
         cv2.putText(out_img, text1, (10, h-50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
         cv2.putText(out_img, text2, (10, h-20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 4)
         cv2.putText(out_img, text2, (10, h-20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
 
-        # 显示结果
-        st.image(out_img, caption="检测结果", use_column_width=True)
+        st.image(out_img, caption="检测结果", use_container_width=True)
         st.success(f"粒子数：{len(props)}")
         st.info(f"平均间距：{avg_spacing:.1f} px")
 
-        # 下载结果图
-        result_path = "result.png"
-        cv2.imwrite(result_path, out_img)
-        with open(result_path, "rb") as f:
-            st.download_button("下载结果图", f, file_name="result.png")
+        # ========== 6. 导出 CSV ==========
+        df = pd.DataFrame({
+            'x': [p[1] for p in props],
+            'y': [p[0] for p in props],
+            'area': [p[2] for p in props],
+            'nearest_dist': nearest_dist if len(nearest_dist) > 0 else [0]*len(props)
+        })
+        csv = df.to_csv(index=False).encode('utf-8')
+        st.download_button("下载 CSV", csv, file_name="particles.csv")
+
+        # ========== 7. 人工验证 ==========
+        st.subheader("人工验证")
+        st.write("随机抽取 10 个粒子，判断它们是否是真实的粒子。")
+
+        np.random.seed(42)
+        sample_size = min(10, len(props))
+        sample_idx = np.random.choice(len(props), sample_size, replace=False)
+
+        if 'verify_results' not in st.session_state:
+            st.session_state.verify_results = {}
+
+        for idx in sample_idx:
+            y, x, area = props[idx]
+
+            # ★ 在原图上标出选中的粒子（绿色圆圈）
+            img_marked = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+            radius = int(np.sqrt(area / np.pi))
+            cv2.circle(img_marked, (int(x), int(y)), max(radius, 2), (0, 255, 0), 1)
+
+            # 截取局部区域
+            y0, y1 = max(0, int(y)-30), min(img.shape[0], int(y)+30)
+            x0, x1 = max(0, int(x)-30), min(img.shape[1], int(x)+30)
+            patch = img_marked[y0:y1, x0:x1]
+
+            # 放大 5 倍
+            patch_big = cv2.resize(patch, None, fx=5, fy=5, interpolation=cv2.INTER_NEAREST)
+
+            col1, col2, col3 = st.columns([1, 1, 2])
+            with col1:
+                st.image(patch_big, caption=f"粒子 {idx}", width=150)
+            with col2:
+                st.write(f"面积：{area}")
+            with col3:
+                choice = st.radio(f"判断 {idx}", ["对", "错"], key=f"verify_{idx}")
+                st.session_state.verify_results[idx] = choice
+
+        if st.button("计算误检率"):
+            results = st.session_state.verify_results
+            total = len(results)
+            correct = sum(1 for v in results.values() if v == "对")
+            wrong = total - correct
+            error_rate = wrong / total * 100 if total > 0 else 0
+
+            st.success(f"验证结果：{correct}/{total} 正确，误检率 {error_rate:.1f}%")
